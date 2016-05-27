@@ -1,12 +1,9 @@
 """
 Node objects for Mininet.
-
 Nodes provide a simple abstraction for interacting with hosts, switches
 and controllers. Local nodes are simply one or more processes on the local
 machine.
-
 Node: superclass for all (primarily local) network nodes.
-
 Host: a virtual host. By default, a host is simply a shell; commands
     may be sent using Cmd (which waits for output), or using sendCmd(),
     which returns immediately, allowing subsequent monitoring using
@@ -14,41 +11,27 @@ Host: a virtual host. By default, a host is simply a shell; commands
     functionality are provided in the examples/ directory. By default,
     hosts share the root file system, but they may also specify private
     directories.
-
 CPULimitedHost: a virtual host whose CPU bandwidth is limited by
     RT or CFS bandwidth limiting.
-
 Switch: superclass for switch nodes.
-
 UserSwitch: a switch using the user-space switch from the OpenFlow
     reference implementation.
-
 OVSSwitch: a switch using the Open vSwitch OpenFlow-compatible switch
     implementation (openvswitch.org).
-
 OVSBridge: an Ethernet bridge implemented using Open vSwitch.
     Supports STP.
-
 IVSSwitch: OpenFlow switch using the Indigo Virtual Switch.
-
 Controller: superclass for OpenFlow controllers. The default controller
     is controller(8) from the reference implementation.
-
 OVSController: The test controller from Open vSwitch.
-
 NOXController: a controller node using NOX (noxrepo.org).
-
 Ryu: The Ryu controller (https://osrg.github.io/ryu/)
-
 RemoteController: a remote controller node, which may use any
     arbitrary OpenFlow-compatible controller, and which is not
     created or managed by Mininet.
-
 Future enhancements:
-
 - Possibly make Node, Switch and Controller more abstract so that
   they can be used for both local and remote nodes
-
 - Create proxy objects for remote nodes (Mininet: Cluster Edition)
 """
 
@@ -212,7 +195,7 @@ class Node( object ):
     # Subshell I/O, commands and control
 
     def read( self, maxbytes=1024 ):
-        """Buffered read from node, potentially blocking.
+        """Buffered read from node, non-blocking.
            maxbytes: maximum number of bytes to return"""
         count = len( self.readbuf )
         if count < maxbytes:
@@ -227,7 +210,7 @@ class Node( object ):
         return result
 
     def readline( self ):
-        """Buffered readline from node, potentially blocking.
+        """Buffered readline from node, non-blocking.
            returns: line (minus newline) or None"""
         self.readbuf += self.read( 1024 )
         if '\n' not in self.readbuf:
@@ -259,10 +242,9 @@ class Node( object ):
 
     def waitReadable( self, timeoutms=None ):
         """Wait until node's output is readable.
-           timeoutms: timeout in ms or None to wait indefinitely.
-           returns: result of poll()"""
+           timeoutms: timeout in ms or None to wait indefinitely."""
         if len( self.readbuf ) == 0:
-            return self.pollOut.poll( timeoutms )
+            self.pollOut.poll( timeoutms )
 
     def sendCmd( self, *args, **kwargs ):
         """Send a command, followed by a command to echo a sentinel,
@@ -304,9 +286,7 @@ class Node( object ):
            Set self.waiting to False if command has completed.
            timeoutms: timeout in ms or None to wait indefinitely
            findPid: look for PID from mnexec -p"""
-        ready = self.waitReadable( timeoutms )
-        if not ready:
-            return ''
+        self.waitReadable( timeoutms )
         data = self.read( 1024 )
         pidre = r'\[\d+\] \d+\r\n'
         # Look for PID
@@ -444,7 +424,6 @@ class Node( object ):
         """Return our interface object with given string name,
            default intf if name is falsy (None, empty string, etc).
            or the input intf arg.
-
         Having this fcn return its arg for Intf objects makes it
         easier to construct functions with flexible input args for
         interfaces (those that accept both string names and Intf objects).
@@ -684,9 +663,7 @@ class CPULimitedHost( Host ):
         "Clean up our cgroup"
         # info( '*** deleting cgroup', self.cgroup, '\n' )
         _out, _err, exitcode = errRun( 'cgdelete -r ' + self.cgroup )
-        # Sometimes cgdelete returns a resource busy error but still
-        # deletes the group; next attempt will give "no such file"
-        return exitcode == 0  or ( 'no such file' in _err.lower() )
+        return exitcode == 0  # success condition
 
     def popen( self, *args, **kwargs ):
         """Return a Popen() object in node's namespace
@@ -708,7 +685,7 @@ class CPULimitedHost( Host ):
     def cleanup( self ):
         "Clean up Node, then clean up our cgroup"
         super( CPULimitedHost, self ).cleanup()
-        retry( retries=3, delaySecs=.1, fn=self.cgroupDel )
+        retry( retries=3, delaySecs=1, fn=self.cgroupDel )
 
     _rtGroupSched = False   # internal class var: Is CONFIG_RT_GROUP_SCHED set?
 
@@ -1028,7 +1005,7 @@ class OVSSwitch( Switch ):
                   inband=False, protocols=None,
                   reconnectms=1000, stp=False, batch=False, **params ):
         """name: name for switch
-           failMode: controller loss behavior (secure|standalone)
+           failMode: controller loss behavior (secure|open)
            datapath: userspace or kernel mode (kernel|user)
            inband: use in-band control (False)
            protocols: use specific OpenFlow version(s) (e.g. OpenFlow13)
@@ -1274,6 +1251,88 @@ class OVSBridge( OVSSwitch ):
         else:
             return True
 
+class OVSBaseQosSwitch( OVSSwitch ):
+    """A version of OVSSwitch which you can use with both TCIntf and OVS's QoS
+       support. Note: this particular class is an abstract base class for
+       OVSHtbQosSwitch or OVSHfscQosSwitch, as OVS supports two types of QoS
+       disciplines: Hierarchical Token Bucket (HTB) and Hierarchical Fair
+       Service Curves (HFSC)."""
+
+    qosType = "__abstract__" # overriden by subclasses below
+    minRateCmd = "__abstract__" # overriden by subclasses below
+
+    def TCReapply( self, intf ):
+        """The general problem here is that Open vSwitch believes it is the only
+           software managing the Linux tc queues on this interface. To maintain
+           this illusion, we first create a default queue with a min-rate of 1
+           bps via ovs-vsctl. Then, Mininet clears these queues, and creates the
+           queues for the TCIntf. We then re-create the queues created by Open
+           vSwitch (1:1 and 1:0xfffe), but place them as a leaf under the
+           hiearchy created by Mininet's TCInf. With these defaults in place,
+           Open vSwith will place new queues under 1:0xfffe as we desire."""
+        if type( intf ) is TCIntf:
+            assert( self.qosType != "__abstract__" )
+
+            # Get OVS's idea of the interface's speed:
+            ifspeed = self.cmd( 'ovs-vsctl get interface ' + intf.name +
+                                ' link_speed' ).rstrip()
+
+            # Establish a default configuration for OVS's QoS
+            self.cmd( 'ovs-vsctl -- set Port ' + intf.name + ' qos=@newqos'
+                      ' -- --id=@newqos create QoS type=linux-' + self.qosType +
+                      ' queues=0=@default' +
+                      ' -- --id=@default create Queue other-config:min-rate=1' )
+            # Reset Mininet's configuration
+            res = intf.config( **intf.params )
+
+            if res is None: # link may not have TC parameters
+                return
+
+            # Re-add qdisc, root, and default classes OVS created, but with
+            # new parent, as setup by Mininet's TCIntf
+            parent = res['parent']
+            intf.tc( "%s qdisc add dev %s " + parent +
+                     " handle 1: " + self.qosType + " default 1" )
+            intf.tc( "%s class add dev %s classid 1:0xfffe parent 1: " +
+                     self.qosType + " " + self.minRateCmd + " " + ifspeed )
+            intf.tc( "%s class add dev %s classid 1:1 parent 1:0xfffe " +
+                     self.qosType + " " + self.minRateCmd + " 1500" )
+
+    def dropOVSqos( self, intf ):
+        """Drops any QoS records on this interface kept by Open vSwitch. This
+           also deletes the corresponding Linux tc queues."""
+        out = self.cmd( 'ovs-vsctl -- get QoS ' + intf.name + ' queues' )
+        out = out.rstrip( "}\n" ).lstrip( "{" ).split( "," )
+        queues = map( lambda x: x.split("=")[1], out )
+
+        self.cmd( 'ovs-vsctl -- destroy QoS ' + intf.name +
+                  ' -- clear Port ' + intf.name + ' qos' )
+
+        for q in queues:
+            self.cmd( 'ovs-vsctl destroy Queue ' + q )
+
+    def detach( self, intf ):
+        if type( intf ) is TCIntf:
+            self.dropOVSqos( intf )
+        OVSSwitch.detach( self, intf )
+
+    def stop( self ):
+        for intf in self.intfList():
+            if type( intf ) is TCIntf:
+                self.dropOVSqos( intf )
+        OVSSwitch.stop( self )
+
+
+class OVSHtbQosSwitch( OVSBaseQosSwitch ):
+    "Open vSwitch with Hierarchical Token Buckets usable with TCIntf."
+    qosType    = "htb"
+    minRateCmd = "rate"
+
+
+class OVSHfscQosSwitch( OVSBaseQosSwitch ):
+    "Open vSwitch with Hierarchical Fair Service Curves usable with TCIntf."
+    qosType    = "hfsc"
+    minRateCmd = "sc rate"
 
 class IVSSwitch( Switch ):
     "Indigo Virtual Switch"
@@ -1351,7 +1410,7 @@ class Controller( Node ):
 
     def __init__( self, name, inNamespace=False, command='controller',
                   cargs='-v ptcp:%d', cdir=None, ip="127.0.0.1",
-                  port=6653, protocol='tcp', **params ):
+                  port=6633, protocol='tcp', **params ):
         self.command = command
         self.cargs = cargs
         self.cdir = cdir
@@ -1431,8 +1490,7 @@ class OVSController( Controller ):
     @classmethod
     def isAvailable( cls ):
         return ( quietRun( 'which ovs-controller' ) or
-                 quietRun( 'which test-controller' ) or
-                 quietRun( 'which ovs-testcontroller' ) )
+                 quietRun( 'which test-controller' ) )
 
 class NOX( Controller ):
     "Controller to run a NOX application."
@@ -1486,7 +1544,7 @@ class RemoteController( Controller ):
     "Controller running outside of Mininet's control."
 
     def __init__( self, name, ip='127.0.0.1',
-                  port=None, **kwargs):
+                  port=6633, **kwargs):
         """Init.
            name: name to give controller
            ip: the IP address where the remote controller is
@@ -1504,30 +1562,12 @@ class RemoteController( Controller ):
 
     def checkListening( self ):
         "Warn if remote controller is not accessible"
-        if self.port is not None:
-            self.isListening( self.ip, self.port )
-        else:
-            for port in 6653, 6633:
-                if self.isListening( self.ip, port ):
-                    self.port = port
-                    info( "Connecting to remote controller"
-                          " at %s:%d\n" % ( self.ip, self.port ))
-                    break
-
-        if self.port is None:
-            self.port = 6653
-            warn( "Setting remote controller"
-                  " to %s:%d\n" % ( self.ip, self.port ))
-
-    def isListening( self, ip, port ):
-        "Check if a remote controller is listening at a specific ip and port"
-        listening = self.cmd( "echo A | telnet -e A %s %d" % ( ip, port ) )
+        listening = self.cmd( "echo A | telnet -e A %s %d" %
+                              ( self.ip, self.port ) )
         if 'Connected' not in listening:
             warn( "Unable to contact the remote controller"
-                  " at %s:%d\n" % ( ip, port ) )
-            return False
-        else:
-            return True
+                  " at %s:%d\n" % ( self.ip, self.port ) )
+
 
 DefaultControllers = ( Controller, OVSController )
 

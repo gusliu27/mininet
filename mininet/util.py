@@ -185,7 +185,7 @@ def makeIntfPair( intf1, intf2, addr1=None, addr2=None, node1=None, node2=None,
     else:
         cmdOutput = runCmd( 'ip link add name %s '
                             'address %s '
- 			    'numtxqueues 8'
+ 			    'numtxqueues 8 '
                             'type veth peer name %s '
                             'address %s '
                             'netns %s' %
